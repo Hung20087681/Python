@@ -1,0 +1,154 @@
+import cv2
+import numpy as np
+import imutils
+import time
+import serial
+
+# Kết nối UART
+uart = serial.Serial(port='COM3', baudrate=115200, timeout=1)
+
+# Mở camera
+cap = cv2.VideoCapture(1)
+time.sleep(2)
+cap.set(3, 640)
+cap.set(4, 480)
+
+# Thiết lập zoom factor
+zoom_factor = 1.7  # Zoom gấp 1.7 lần
+
+# Ngưỡng màu HSV
+COLOR_THRESHOLDS = {
+    "red_lower": (np.array([0, 100, 50], np.uint8), np.array([10, 255, 255], np.uint8)),
+    "red_upper": (np.array([170, 100, 50], np.uint8), np.array([180, 255, 255], np.uint8)),
+    "yellow": (np.array([15, 80, 80], np.uint8), np.array([35, 255, 255], np.uint8)),
+    "blue": (np.array([90, 50, 50], np.uint8), np.array([130, 255, 255], np.uint8))  # Điều chỉnh ngưỡng xanh dương
+}
+
+COLOR_IDS = {"red": 1, "yellow": 3, "blue": 2}
+CONTOUR_AREA_THRESHOLD = 500
+
+# 5 điểm trong không gian ảnh (pixel)
+points_image = np.float32([[228, 340], [130, 89], [508, 281], [455, 159], [367, 112]])
+
+# 5 điểm tương ứng trong không gian thực tế (ví dụ: cm hoặc mm)
+points_real = np.float32([[75, -75], [-25, -75], [75, 25], [25, 25], [0, 0]])
+
+# Tính toán ma trận homography từ các điểm
+H, status = cv2.findHomography(points_image, points_real)
+
+# Hàm lấy tên hình dạng cơ bản
+def get_basic_shape_name(approx):
+    vertices = len(approx)
+    if vertices == 3:
+        return "Tam giac"
+    elif vertices == 4:
+        return "Tu giac"
+    else:
+        return "Hinh tron"
+
+# Hàm vẽ hình dạng và thông tin lên khung hình
+def draw_shape(frame, contour, shape, cx, cy, color):
+    cv2.drawContours(frame, [contour], -1, color, 2)
+    cv2.putText(frame, shape, (cx - 50, cy - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    cv2.putText(frame, f"({cx}, {cy})", (cx + 10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+    cv2.circle(frame, (cx, cy), 5, (255, 0, 0), -1)
+
+# Hàm chuyển đổi tọa độ ảnh sang tọa độ thực tế
+def convert_to_real_coordinates(cx, cy, homography_matrix):
+    point = np.float32([cx, cy]).reshape(1, 1, 2)  # Đảm bảo định dạng là (1, 1, 2)
+    point_real = cv2.perspectiveTransform(point, homography_matrix)  # Chuyển đổi bằng phép biến đổi perspective
+    return point_real[0][0]
+
+# Hàm cập nhật tọa độ robot qua UART
+def update_robot_position(object_data):
+    if object_data:
+        try:
+            data_string = "\n".join(object_data) + "\n"
+            uart.write(data_string.encode('utf-8'))
+            print(f"Sent: {data_string.strip()}")
+        except Exception as e:
+            print("UART Error:", e)
+
+try:
+    while True:
+        object_data = []
+        ret, frame = cap.read()
+        if not ret:
+            print("Lỗi khi lấy khung hình từ camera!")
+            break
+
+        # Kích thước gốc của khung hình
+        height, width, _ = frame.shape
+
+        # Tính toán vùng crop (zoom vào trung tâm)
+        crop_width = int(width / zoom_factor)
+        crop_height = int(height / zoom_factor)
+        x1 = (width - crop_width) // 2
+        y1 = (height - crop_height) // 2
+        x2 = x1 + crop_width
+        y2 = y1 + crop_height
+
+        # Cắt khung hình
+        cropped_frame = frame[y1:y2, x1:x2]
+
+        # Phóng to khung hình để khớp kích thước gốc
+        frame = cv2.resize(cropped_frame, (width, height), interpolation=cv2.INTER_LINEAR)
+
+        blurred = cv2.GaussianBlur(frame, (9, 9), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+        for color_name, (lower, upper) in COLOR_THRESHOLDS.items():
+            mask = cv2.inRange(hsv, lower, upper)
+
+            if "red" in color_name:
+                # Mặt nạ cho màu đỏ ở đầu và cuối dải HSV
+                red_lower_mask = cv2.inRange(hsv, COLOR_THRESHOLDS["red_lower"][0], COLOR_THRESHOLDS["red_lower"][1])
+                red_upper_mask = cv2.inRange(hsv, COLOR_THRESHOLDS["red_upper"][0], COLOR_THRESHOLDS["red_upper"][1])
+                mask = cv2.bitwise_or(red_lower_mask, red_upper_mask)
+
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+            contours = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            contours = imutils.grab_contours(contours)
+
+            if "red" in color_name:
+                draw_color = (0, 0, 255)
+                color_id = COLOR_IDS["red"]
+            elif color_name == "yellow":
+                draw_color = (0, 255, 255)
+                color_id = COLOR_IDS["yellow"]
+            elif color_name == "blue":
+                draw_color = (255, 0, 0)
+                color_id = COLOR_IDS["blue"]
+
+            for contour in contours:
+                approx = cv2.approxPolyDP(contour, 0.04 * cv2.arcLength(contour, True), True)
+                area = cv2.contourArea(contour)
+
+                if area > CONTOUR_AREA_THRESHOLD:
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        shape = get_basic_shape_name(approx)
+                        draw_shape(frame, contour, shape, cx, cy, draw_color)
+
+                        # Chuyển đổi tọa độ từ ảnh sang thực tế
+                        real_coordinates = convert_to_real_coordinates(cx, cy, H)
+                        object_data.append(f"{color_id},{real_coordinates[0]},{real_coordinates[1]}")
+                        print(f"Color ID: {color_id}, Coordinates: ({real_coordinates[0]}, {real_coordinates[1]}), Shape: {shape}")
+
+        # Gửi dữ liệu tới robot qua UART
+        update_robot_position(object_data)
+
+        cv2.imshow('Screen', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    uart.close()
+
